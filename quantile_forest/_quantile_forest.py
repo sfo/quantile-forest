@@ -249,20 +249,32 @@ class BaseForestQuantileRegressor(ForestRegressor):
             warnings.simplefilter("ignore", UserWarning)
             X_leaves = self.apply(X)
 
-        shape = (n_samples, self.n_estimators)
-        bootstrap_indices = np.empty(shape, dtype=np.int64)
-        for i, estimator in enumerate(self.estimators_):
+        def worker_step1(estimator, X_leave, n_samples, bootstrap, max_samples):
+            bootstrap_indices = np.empty(n_samples, dtype=np.int64)
             # Get bootstrap indices.
-            if self.bootstrap:
-                n_samples_bootstrap = _get_n_samples_bootstrap(n_samples, self.max_samples)
-                bootstrap_indices[:, i] = _generate_sample_indices(
+            if bootstrap:
+                n_samples_bootstrap = _get_n_samples_bootstrap(n_samples, max_samples)
+                bootstrap_indices = _generate_sample_indices(
                     estimator.random_state, n_samples, n_samples_bootstrap
                 )
             else:
-                bootstrap_indices[:, i] = np.arange(n_samples)
+                bootstrap_indices = np.arange(n_samples)
 
             # Get predictions on bootstrap indices.
-            X_leaves[:, i] = X_leaves[bootstrap_indices[:, i], i]
+            X_leave = X_leave[bootstrap_indices]
+
+            return X_leave, bootstrap_indices
+
+        data = joblib.Parallel(n_jobs=self.n_jobs)(joblib.delayed(worker_step1)(
+            e,
+            X_leaves[:, i],
+            n_samples,
+            self.bootstrap,
+            self.max_samples,
+        ) for i, e in enumerate(self.estimators_))
+        data = np.array(data).T
+        X_leaves = data[:, 0, :]
+        bootstrap_indices = data[:, 1, :]
 
         if sorter is not None:
             # Reassign bootstrap indices to account for target sorting.
@@ -283,20 +295,19 @@ class BaseForestQuantileRegressor(ForestRegressor):
                 if sample_count > max_samples_leaf:
                     max_samples_leaf = sample_count
 
-        # Initialize NumPy array (more efficient serialization than dict/list).
-        shape = (self.n_estimators, max_node_count, max_samples_leaf)
-        y_train_leaves = np.zeros(shape, dtype=np.int64)
+        def worker_step2(estimator, X_leave, bootstrap_indices, max_node_count, leaf_subsample, max_samples_leaf, sample_weight):
+            shape = (max_node_count, max_samples_leaf)
+            y_train_leave = np.zeros(shape, dtype=np.int64)
 
-        for i, estimator in enumerate(self.estimators_):
             # Group training indices by leaf node.
-            leaf_indices, leaf_values_list = _group_by_value(X_leaves[:, i])
+            leaf_indices, leaf_values_list = _group_by_value(X_leave)
 
             if leaf_subsample:
                 random.seed(estimator.random_state)
 
             # Map each leaf node to its list of training indices.
             for leaf_idx, leaf_values in zip(leaf_indices, leaf_values_list):
-                y_indices = bootstrap_indices[:, i][leaf_values]
+                y_indices = bootstrap_indices[leaf_values]
 
                 if sample_weight is not None:
                     y_indices = y_indices[sample_weight[y_indices - 1] > 0]
@@ -307,9 +318,19 @@ class BaseForestQuantileRegressor(ForestRegressor):
                         y_indices = list(y_indices)
                     y_indices = random.sample(y_indices, max_samples_leaf)
 
-                y_train_leaves[i, leaf_idx, : len(y_indices)] = y_indices
+                y_train_leave[leaf_idx, : len(y_indices)] = y_indices
+            return y_train_leave
 
-        return y_train_leaves
+        y_train_leaves = joblib.Parallel(n_jobs=self.n_jobs)(joblib.delayed(worker_step2)(
+            e,
+            X_leaves[:, i],
+            bootstrap_indices[:, i],
+            max_node_count,
+            leaf_subsample,
+            max_samples_leaf,
+            sample_weight,
+        ) for i, e in enumerate(self.estimators_))
+        return np.array(y_train_leaves)
 
     def _oob_samples(self, X, indices=None, duplicates=None):
         """Generate out-of-bag (OOB) samples for each base estimator.
